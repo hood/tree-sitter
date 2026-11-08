@@ -287,8 +287,23 @@ typedef struct {
 
 typedef struct {
   TSSymbol symbol;
+  TSStateId state;
+  uint32_t node_index;
+} AnalysisSubgraphEdge;
+
+typedef struct {
+  TSStateId state;
+  uint32_t offset;
+  uint32_t length;
+} AnalysisSubgraphEdgeRange;
+
+typedef struct {
+  TSSymbol symbol;
   Array(TSStateId) start_states;
   Array(AnalysisSubgraphNode) nodes;
+  uint32_t *node_states;
+  Array(AnalysisSubgraphEdge) edges;
+  Array(AnalysisSubgraphEdgeRange) edge_ranges;
 } AnalysisSubgraph;
 
 typedef Array(AnalysisSubgraph) AnalysisSubgraphArray;
@@ -301,6 +316,16 @@ typedef Array(AnalysisSubgraph) AnalysisSubgraphArray;
 typedef struct {
   TSStateId *contents;
 } StatePredecessorMap;
+
+typedef struct {
+  TSSymbol symbol;
+  TSStateId state;
+} StateTransition;
+
+typedef struct {
+  Array(StateTransition) transitions;
+  uint32_t *offsets;
+} StateTransitionMap;
 
 /*
  * TSQuery - A tree query, compiled from a string of S-expressions. The query
@@ -1221,6 +1246,38 @@ static inline int analysis_subgraph_node__compare(const AnalysisSubgraphNode *se
   return 0;
 }
 
+static inline const AnalysisSubgraphEdgeRange *analysis_subgraph__edges(
+  AnalysisSubgraph *self,
+  const StateTransitionMap *transition_map,
+  TSStateId parse_state
+) {
+  unsigned index, exists;
+  array_search_sorted_by(&self->edge_ranges, .state, parse_state, &index, &exists);
+  if (!exists) {
+    AnalysisSubgraphEdgeRange range = {.state = parse_state, .offset = self->edges.size};
+    for (
+      uint32_t i = transition_map->offsets[parse_state];
+      i < transition_map->offsets[parse_state + 1];
+      i++
+    ) {
+      const StateTransition *transition = array_get(&transition_map->transitions, i);
+      TSStateId state = transition->state ? transition->state : parse_state;
+      if (!(self->node_states[state / 32] & (1u << (state % 32)))) continue;
+      AnalysisSubgraphNode needle = {.state = state};
+      unsigned node_index, node_exists;
+      array_search_sorted_with(&self->nodes, analysis_subgraph_node__compare, &needle, &node_index, &node_exists);
+      array_push(&self->edges, ((AnalysisSubgraphEdge) {
+        .symbol = transition->symbol,
+        .state = transition->state,
+        .node_index = node_index,
+      }));
+    }
+    range.length = self->edges.size - range.offset;
+    array_insert(&self->edge_ranges, index, range);
+  }
+  return array_get(&self->edge_ranges, index);
+}
+
 /*********
  * Query
  *********/
@@ -1310,7 +1367,8 @@ static inline void ts_query__pattern_map_insert(
 // sequences of progress within the pattern.
 static void ts_query__perform_analysis(
   TSQuery *self,
-  const AnalysisSubgraphArray *subgraphs,
+  AnalysisSubgraphArray *subgraphs,
+  const StateTransitionMap *transition_map,
   QueryAnalysis *analysis
 ) {
   unsigned recursion_depth_limit = 0;
@@ -1414,45 +1472,30 @@ static void ts_query__perform_analysis(
       unsigned subgraph_index, exists;
       array_search_sorted_by(subgraphs, .symbol, parent_symbol, &subgraph_index, &exists);
       if (!exists) continue;
-      const AnalysisSubgraph *subgraph = array_get(subgraphs, subgraph_index);
+      AnalysisSubgraph *subgraph = array_get(subgraphs, subgraph_index);
 
       // Follow every possible path in the parse table, but only visit states that
       // are part of the subgraph for the current symbol.
-      LookaheadIterator lookahead_iterator = ts_language_lookaheads(self->language, parse_state);
-      while (ts_lookahead_iterator__next(&lookahead_iterator)) {
-        TSSymbol sym = lookahead_iterator.symbol;
+      const AnalysisSubgraphEdgeRange *edge_range = analysis_subgraph__edges(subgraph, transition_map, parse_state);
+      for (uint32_t edge_index = 0; edge_index < edge_range->length; edge_index++) {
+        const AnalysisSubgraphEdge *edge = array_get(&subgraph->edges, edge_range->offset + edge_index);
+        TSSymbol sym = edge->symbol;
 
         AnalysisSubgraphNode successor = {
           .state = parse_state,
           .child_index = child_index,
         };
-        if (lookahead_iterator.action_count) {
-          const TSParseAction *action = &lookahead_iterator.actions[lookahead_iterator.action_count - 1];
-          if (action->type == TSParseActionTypeShift) {
-            if (!action->shift.extra) {
-              successor.state = action->shift.state;
-              successor.child_index++;
-            }
-          } else {
-            continue;
-          }
-        } else if (lookahead_iterator.next_state != 0) {
-          successor.state = lookahead_iterator.next_state;
+        if (edge->state) {
+          successor.state = edge->state;
           successor.child_index++;
-        } else {
-          continue;
         }
 
-        unsigned node_index;
-        array_search_sorted_with(
-          &subgraph->nodes,
-          analysis_subgraph_node__compare, &successor,
-          &node_index, &exists
-        );
+        unsigned node_index = edge->node_index;
         while (node_index < subgraph->nodes.size) {
           AnalysisSubgraphNode *node = array_get(&subgraph->nodes, node_index);
           node_index++;
-          if (node->state != successor.state || node->child_index != successor.child_index) break;
+          if (node->state != successor.state || node->child_index > successor.child_index) break;
+          if (node->child_index < successor.child_index) continue;
 
           // Use the subgraph to determine what alias and field will eventually be applied
           // to this child node.
@@ -1769,11 +1812,24 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
   //      with information about the node that would be created.
   //   3) A list of predecessor states for each state.
   StatePredecessorMap predecessor_map = state_predecessor_map_new(self->language);
+  StateTransitionMap transition_map = {
+    .transitions = array_new(),
+    .offsets = ts_calloc((size_t)self->language->state_count + 1, sizeof(uint32_t)),
+  };
   for (TSStateId state = 1; state < (uint16_t)self->language->state_count; state++) {
     unsigned subgraph_index, exists;
+    transition_map.offsets[state] = transition_map.transitions.size;
     LookaheadIterator lookahead_iterator = ts_language_lookaheads(self->language, state);
     while (ts_lookahead_iterator__next(&lookahead_iterator)) {
       if (lookahead_iterator.action_count) {
+        const TSParseAction *last_action = &lookahead_iterator.actions[lookahead_iterator.action_count - 1];
+        if (last_action->type == TSParseActionTypeShift) {
+          if (last_action->shift.extra) {
+            array_push(&transition_map.transitions, ((StateTransition) {lookahead_iterator.symbol, 0}));
+          } else if (last_action->shift.state) {
+            array_push(&transition_map.transitions, ((StateTransition) {lookahead_iterator.symbol, last_action->shift.state}));
+          }
+        }
         for (unsigned i = 0; i < lookahead_iterator.action_count; i++) {
           const TSParseAction *action = &lookahead_iterator.actions[i];
           if (action->type == TSParseActionTypeReduce) {
@@ -1810,6 +1866,7 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
           }
         }
       } else if (lookahead_iterator.next_state != 0) {
+        array_push(&transition_map.transitions, ((StateTransition) {lookahead_iterator.symbol, lookahead_iterator.next_state}));
         if (lookahead_iterator.next_state != state) {
           state_predecessor_map_add(&predecessor_map, lookahead_iterator.next_state, state);
         }
@@ -1842,6 +1899,8 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
       }
     }
   }
+
+  transition_map.offsets[self->language->state_count] = transition_map.transitions.size;
 
   // For each subgraph, compute the preceding states by walking backward
   // from the end states using the predecessor map.
@@ -1882,6 +1941,15 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
           }
         }
       }
+    }
+  }
+
+  for (unsigned i = 0; i < subgraphs.size; i++) {
+    AnalysisSubgraph *subgraph = array_get(&subgraphs, i);
+    subgraph->node_states = ts_calloc((self->language->state_count + 31) / 32, sizeof(uint32_t));
+    for (unsigned j = 0; j < subgraph->nodes.size; j++) {
+      TSStateId state = array_get(&subgraph->nodes, j)->state;
+      subgraph->node_states[state / 32] |= 1u << (state % 32);
     }
   }
 
@@ -1961,7 +2029,7 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
     #endif
 
     analysis.did_abort = false;
-    ts_query__perform_analysis(self, &subgraphs, &analysis);
+    ts_query__perform_analysis(self, &subgraphs, &transition_map, &analysis);
 
     // If this pattern could not be fully analyzed, then every step should
     // be considered fallible.
@@ -2135,6 +2203,7 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
     ts_query__perform_analysis(
       self,
       &subgraphs,
+      &transition_map,
       &analysis
     );
 
@@ -2164,12 +2233,17 @@ static bool ts_query__analyze_patterns(TSQuery *self, unsigned *error_offset) {
   for (unsigned i = 0; i < subgraphs.size; i++) {
     array_delete(&array_get(&subgraphs, i)->start_states);
     array_delete(&array_get(&subgraphs, i)->nodes);
+    ts_free(array_get(&subgraphs, i)->node_states);
+    array_delete(&array_get(&subgraphs, i)->edges);
+    array_delete(&array_get(&subgraphs, i)->edge_ranges);
   }
   array_delete(&subgraphs);
   query_analysis__delete(&analysis);
   array_delete(&next_nodes);
   array_delete(&predicate_capture_ids);
   state_predecessor_map_delete(&predecessor_map);
+  array_delete(&transition_map.transitions);
+  ts_free(transition_map.offsets);
 
 supertype_cleanup:
   array_delete(&non_rooted_pattern_start_steps);
