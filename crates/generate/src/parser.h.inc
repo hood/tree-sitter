@@ -152,21 +152,20 @@ struct TSLanguage {
 };
 
 static inline bool set_contains(const TSCharacterRange *ranges, uint32_t len, int32_t lookahead) {
+  if (lookahead < 128) {
+    for (uint32_t i = 0; i < len && ranges[i].start <= lookahead; i++) {
+      if (lookahead <= ranges[i].end) return true;
+    }
+    return false;
+  }
   uint32_t index = 0;
-  uint32_t size = len - index;
+  uint32_t size = len;
   while (size > 1) {
     uint32_t half_size = size / 2;
-    uint32_t mid_index = index + half_size;
-    const TSCharacterRange *range = &ranges[mid_index];
-    if (lookahead >= range->start && lookahead <= range->end) {
-      return true;
-    } else if (lookahead > range->end) {
-      index = mid_index;
-    }
+    if (lookahead >= ranges[index + half_size].start) index += half_size;
     size -= half_size;
   }
-  const TSCharacterRange *range = &ranges[index];
-  return (lookahead >= range->start && lookahead <= range->end);
+  return lookahead >= ranges[index].start && lookahead <= ranges[index].end;
 }
 
 /*
