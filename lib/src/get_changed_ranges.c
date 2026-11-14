@@ -189,6 +189,13 @@ static Length iterator_end_position(Iterator *self) {
   }
 }
 
+static uint32_t iterator_end_byte(const Iterator *self) {
+  const TreeCursorEntry *entry = array_back(&self->cursor.stack);
+  uint32_t result = entry->position.bytes + ts_subtree_padding(*entry->subtree).bytes;
+  if (!self->in_padding) result += ts_subtree_size(*entry->subtree).bytes;
+  return result;
+}
+
 static bool iterator_tree_is_visible(const Iterator *self) {
   TreeCursorEntry entry = *array_back(&self->cursor.stack);
   if (ts_subtree_visible(*entry.subtree)) return true;
@@ -336,6 +343,49 @@ static void iterator_advance(Iterator *self) {
   }
 }
 
+static void iterator_skip_to_ancestor(Iterator *self, uint32_t index) {
+  while (self->cursor.stack.size - 1 > index) {
+    if (iterator_tree_is_visible(self)) self->visible_depth--;
+    self->cursor.stack.size--;
+  }
+  iterator_advance(self);
+}
+
+static bool iterator_find_shared_ancestor(
+  const Iterator *old_iter,
+  const Iterator *new_iter,
+  uint32_t *old_index,
+  uint32_t *new_index
+) {
+  if (old_iter->in_padding || new_iter->in_padding) return false;
+  uint32_t i = old_iter->cursor.stack.size - 1;
+  uint32_t j = new_iter->cursor.stack.size - 1;
+  bool found = false;
+  while (i > 1 && j > 1) {
+    const TreeCursorEntry *old_entry = array_get(&old_iter->cursor.stack, i - 1);
+    const TreeCursorEntry *new_entry = array_get(&new_iter->cursor.stack, j - 1);
+    Subtree tree = *old_entry->subtree;
+    if (
+      tree.ptr != new_entry->subtree->ptr ||
+      old_entry->position.bytes != new_entry->position.bytes ||
+      ts_subtree_visible(tree) ||
+      ts_subtree_has_changes(tree)
+    ) break;
+    const Subtree *parent = array_get(&old_iter->cursor.stack, i - 2)->subtree;
+    if (ts_language_alias_at(
+      old_iter->language,
+      parent->ptr->production_id,
+      old_entry->structural_child_index
+    )) break;
+    i--;
+    j--;
+    found = true;
+  }
+  *old_index = i;
+  *new_index = j;
+  return found;
+}
+
 typedef enum {
   IteratorDiffers,
   IteratorMayDiffer,
@@ -450,7 +500,7 @@ uint32_t ts_subtree_get_changed_ranges(
       included_range_differences,
       included_range_difference_index,
       position.bytes,
-      iterator_end_position(&old_iter).bytes
+      iterator_end_byte(&old_iter)
     )) {
       comparison = IteratorMayDiffer;
     }
@@ -459,9 +509,25 @@ uint32_t ts_subtree_get_changed_ranges(
     switch (comparison) {
       // If the subtrees are definitely identical, move to the end
       // of both subtrees.
-      case IteratorMatches:
+      case IteratorMatches: {
         next_position = iterator_end_position(&old_iter);
+        uint32_t old_index, new_index;
+        if (iterator_find_shared_ancestor(&old_iter, &new_iter, &old_index, &new_index)) {
+          const TreeCursorEntry *entry = array_get(&old_iter.cursor.stack, old_index);
+          Length end = length_add(entry->position, ts_subtree_total_size(*entry->subtree));
+          if (!ts_range_array_intersects(
+            included_range_differences,
+            included_range_difference_index,
+            position.bytes,
+            end.bytes
+          )) {
+            next_position = end;
+            iterator_skip_to_ancestor(&old_iter, old_index);
+            iterator_skip_to_ancestor(&new_iter, new_index);
+          }
+        }
         break;
+      }
 
       // If the subtrees might differ internally, descend into both
       // subtrees, finding the first child that spans the current position.
@@ -496,11 +562,11 @@ uint32_t ts_subtree_get_changed_ranges(
     // Ensure that both iterators are caught up to the current position.
     while (
       !iterator_done(&old_iter) &&
-      iterator_end_position(&old_iter).bytes <= next_position.bytes
+      iterator_end_byte(&old_iter) <= next_position.bytes
     ) iterator_advance(&old_iter);
     while (
       !iterator_done(&new_iter) &&
-      iterator_end_position(&new_iter).bytes <= next_position.bytes
+      iterator_end_byte(&new_iter) <= next_position.bytes
     ) iterator_advance(&new_iter);
 
     // Ensure that both iterators are at the same depth in the tree.
